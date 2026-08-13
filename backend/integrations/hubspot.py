@@ -45,8 +45,8 @@ SCOPES = "oauth crm.objects.contacts.read"
 
 async def authorize_hubspot(user_id, org_id):
     """
-    Generate the HubSpot OAuth authorization URL
-    and store OAuth state temporarily in Redis.
+    Generate a HubSpot OAuth authorization URL
+    and temporarily store OAuth state in Redis.
     """
 
     if not CLIENT_ID:
@@ -84,10 +84,11 @@ async def authorize_hubspot(user_id, org_id):
 
 async def oauth2callback_hubspot(request: Request):
     """
-    Handle HubSpot OAuth callback.
+    Handle the HubSpot OAuth callback.
 
-    Exchanges the authorization code for an access token
-    and refresh token.
+    Validates the OAuth state, exchanges the authorization
+    code for access and refresh tokens, and temporarily
+    stores the credentials in Redis.
     """
 
     error = request.query_params.get("error")
@@ -119,7 +120,7 @@ async def oauth2callback_hubspot(request: Request):
         )
 
     # --------------------------------------------------------
-    # Validate state
+    # Validate OAuth state
     # --------------------------------------------------------
 
     saved_state = await get_value_redis(
@@ -131,6 +132,9 @@ async def oauth2callback_hubspot(request: Request):
             status_code=400,
             detail="Invalid or expired state.",
         )
+
+    if isinstance(saved_state, bytes):
+        saved_state = saved_state.decode("utf-8")
 
     state_data = json.loads(saved_state)
 
@@ -160,7 +164,6 @@ async def oauth2callback_hubspot(request: Request):
     # --------------------------------------------------------
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-
         response = await client.post(
             TOKEN_URL,
             data={
@@ -189,21 +192,26 @@ async def oauth2callback_hubspot(request: Request):
     credentials = response.json()
 
     # --------------------------------------------------------
-    # Store when the access token was obtained
+    # Store token expiration information
     # --------------------------------------------------------
 
-    expires_in = credentials.get("expires_in", 1800)
+    expires_in = credentials.get(
+        "expires_in",
+        1800,
+    )
 
-    credentials["obtained_at"] = int(
+    obtained_at = int(
         datetime.now(timezone.utc).timestamp()
     )
 
+    credentials["obtained_at"] = obtained_at
+
     credentials["expires_at"] = (
-        credentials["obtained_at"] + expires_in
+        obtained_at + expires_in
     )
 
     # --------------------------------------------------------
-    # Delete OAuth state
+    # OAuth state is single-use
     # --------------------------------------------------------
 
     await delete_key_redis(
@@ -220,11 +228,21 @@ async def oauth2callback_hubspot(request: Request):
         expire=600,
     )
 
+    # --------------------------------------------------------
+    # Close OAuth popup
+    # --------------------------------------------------------
+
     close_window_script = """
     <html>
-        <script>
-            window.close();
-        </script>
+        <head>
+            <title>HubSpot Connected</title>
+        </head>
+        <body>
+            <script>
+                window.close();
+            </script>
+            <p>HubSpot connected successfully. You can close this window.</p>
+        </body>
     </html>
     """
 
@@ -255,7 +273,14 @@ async def get_hubspot_credentials(user_id, org_id):
     if isinstance(credentials, bytes):
         credentials = credentials.decode("utf-8")
 
-    credentials = json.loads(credentials)
+    if isinstance(credentials, str):
+        try:
+            credentials = json.loads(credentials)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail="Stored HubSpot credentials are invalid.",
+            )
 
     if not credentials:
         raise HTTPException(
@@ -263,6 +288,7 @@ async def get_hubspot_credentials(user_id, org_id):
             detail="No credentials found.",
         )
 
+    # Credentials are retrieved once by the frontend.
     await delete_key_redis(
         f"hubspot_credentials:{org_id}:{user_id}"
     )
@@ -303,7 +329,6 @@ async def refresh_hubspot_access_token(
         )
 
     async with httpx.AsyncClient(timeout=20.0) as client:
-
         response = await client.post(
             TOKEN_URL,
             data={
@@ -320,7 +345,6 @@ async def refresh_hubspot_access_token(
         )
 
     if response.status_code != 200:
-
         error_data = {}
 
         try:
@@ -331,7 +355,6 @@ async def refresh_hubspot_access_token(
         error_type = error_data.get("error")
 
         if error_type == "invalid_grant":
-
             raise HTTPException(
                 status_code=401,
                 detail=(
@@ -350,8 +373,8 @@ async def refresh_hubspot_access_token(
 
     new_credentials = response.json()
 
-    # HubSpot normally returns the refresh token again,
-    # but keep the old one if it doesn't.
+    # HubSpot normally returns the refresh token again.
+    # Keep the old one if it is not returned.
     if not new_credentials.get("refresh_token"):
         new_credentials["refresh_token"] = refresh_token
 
@@ -381,15 +404,21 @@ async def get_valid_hubspot_credentials(credentials):
     """
     Check whether the HubSpot access token is still valid.
 
-    Refresh it automatically when it is expired or about
-    to expire.
+    Automatically refreshes the token when it is expired
+    or about to expire.
     """
 
     if isinstance(credentials, bytes):
         credentials = credentials.decode("utf-8")
 
     if isinstance(credentials, str):
-        credentials = json.loads(credentials)
+        try:
+            credentials = json.loads(credentials)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid HubSpot credentials.",
+            )
 
     if not credentials:
         raise HTTPException(
@@ -397,7 +426,9 @@ async def get_valid_hubspot_credentials(credentials):
             detail="No HubSpot credentials provided.",
         )
 
-    access_token = credentials.get("access_token")
+    access_token = credentials.get(
+        "access_token"
+    )
 
     if not access_token:
         raise HTTPException(
@@ -409,11 +440,15 @@ async def get_valid_hubspot_credentials(credentials):
     # Determine expiration
     # --------------------------------------------------------
 
-    expires_at = credentials.get("expires_at")
+    expires_at = credentials.get(
+        "expires_at"
+    )
 
     if expires_at is None:
 
-        obtained_at = credentials.get("obtained_at")
+        obtained_at = credentials.get(
+            "obtained_at"
+        )
 
         if obtained_at is not None:
 
@@ -427,7 +462,7 @@ async def get_valid_hubspot_credentials(credentials):
             )
 
     # --------------------------------------------------------
-    # If we don't know expiration, use current token.
+    # If expiration is unknown, use current token
     # --------------------------------------------------------
 
     if expires_at is None:
@@ -471,7 +506,7 @@ async def get_valid_hubspot_credentials(credentials):
 # ============================================================
 
 def create_integration_item_metadata_object(
-    response_json
+    response_json,
 ) -> IntegrationItem:
     """
     Convert a HubSpot contact response into an
@@ -497,6 +532,8 @@ def create_integration_item_metadata_object(
         f"{first_name} {last_name}"
     ).strip()
 
+    # Fall back to email when a contact
+    # does not have a name.
     if not full_name:
 
         full_name = (
@@ -562,13 +599,18 @@ def create_integration_item_metadata_object(
 # ============================================================
 
 async def get_items_hubspot(
-    credentials
+    credentials,
 ) -> list[IntegrationItem]:
     """
-    Retrieve HubSpot contacts.
+    Retrieve HubSpot contacts and convert them into
+    IntegrationItem objects.
 
-    Automatically refreshes the access token when
-    necessary.
+    Handles:
+    - JSON/string/bytes credentials
+    - Access-token expiration
+    - Access-token refresh
+    - 401 retry
+    - Pagination
     """
 
     # --------------------------------------------------------
@@ -579,7 +621,16 @@ async def get_items_hubspot(
         credentials = credentials.decode("utf-8")
 
     if isinstance(credentials, str):
-        credentials = json.loads(credentials)
+
+        try:
+            credentials = json.loads(credentials)
+
+        except json.JSONDecodeError:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid HubSpot credentials.",
+            )
 
     if not credentials:
 
@@ -589,7 +640,7 @@ async def get_items_hubspot(
         )
 
     # --------------------------------------------------------
-    # Refresh token if necessary
+    # Make sure the access token is valid
     # --------------------------------------------------------
 
     credentials = (
@@ -618,16 +669,13 @@ async def get_items_hubspot(
         "crm/v3/objects/contacts"
     )
 
-    params = {
-        "limit": 100,
-        "properties": (
-            "firstname,"
-            "lastname,"
-            "email,"
-            "phone,"
-            "company"
-        ),
-    }
+    properties = (
+        "firstname,"
+        "lastname,"
+        "email,"
+        "phone,"
+        "company"
+    )
 
     headers = {
         "Authorization": (
@@ -636,58 +684,28 @@ async def get_items_hubspot(
         "Content-Type": "application/json",
     }
 
+    integration_items = []
+
+    # HubSpot uses the `after` cursor for pagination.
+    after = None
+
+    # --------------------------------------------------------
+    # Pagination loop
+    # --------------------------------------------------------
+
     async with httpx.AsyncClient(
         timeout=20.0
     ) as client:
 
-        response = await client.get(
-            url,
-            headers=headers,
-            params=params,
-        )
+        while True:
 
-    # --------------------------------------------------------
-    # Handle expired/invalid token
-    # --------------------------------------------------------
+            params = {
+                "limit": 100,
+                "properties": properties,
+            }
 
-    if response.status_code == 401:
-
-        refresh_token = credentials.get(
-            "refresh_token"
-        )
-
-        if not refresh_token:
-
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    "HubSpot access token expired. "
-                    "Please reconnect HubSpot."
-                ),
-            )
-
-        print(
-            "HubSpot returned 401. "
-            "Attempting token refresh..."
-        )
-
-        credentials = (
-            await refresh_hubspot_access_token(
-                refresh_token
-            )
-        )
-
-        access_token = credentials.get(
-            "access_token"
-        )
-
-        headers["Authorization"] = (
-            f"Bearer {access_token}"
-        )
-
-        async with httpx.AsyncClient(
-            timeout=20.0
-        ) as client:
+            if after is not None:
+                params["after"] = after
 
             response = await client.get(
                 url,
@@ -695,49 +713,131 @@ async def get_items_hubspot(
                 params=params,
             )
 
-    # --------------------------------------------------------
-    # Handle API errors
-    # --------------------------------------------------------
+            # ------------------------------------------------
+            # Handle expired/invalid access token
+            # ------------------------------------------------
 
-    if response.status_code != 200:
+            if response.status_code == 401:
 
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=(
-                "Failed to retrieve HubSpot "
-                "contacts: "
-                f"{response.text}"
-            ),
-        )
+                refresh_token = credentials.get(
+                    "refresh_token"
+                )
 
-    # --------------------------------------------------------
-    # Convert results
-    # --------------------------------------------------------
+                if not refresh_token:
 
-    response_json = response.json()
+                    raise HTTPException(
+                        status_code=401,
+                        detail=(
+                            "HubSpot access token expired. "
+                            "Please reconnect HubSpot."
+                        ),
+                    )
 
-    results = response_json.get(
-        "results",
-        [],
-    )
+                print(
+                    "HubSpot returned 401. "
+                    "Attempting token refresh..."
+                )
 
-    integration_items = []
+                credentials = (
+                    await refresh_hubspot_access_token(
+                        refresh_token
+                    )
+                )
 
-    for result in results:
+                access_token = credentials.get(
+                    "access_token"
+                )
 
-        integration_item = (
-            create_integration_item_metadata_object(
-                result
+                headers["Authorization"] = (
+                    f"Bearer {access_token}"
+                )
+
+                # Retry the same page after refreshing.
+                response = await client.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                )
+
+            # ------------------------------------------------
+            # Handle API errors
+            # ------------------------------------------------
+
+            if response.status_code != 200:
+
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=(
+                        "Failed to retrieve HubSpot "
+                        "contacts: "
+                        f"{response.text}"
+                    ),
+                )
+
+            # ------------------------------------------------
+            # Parse response
+            # ------------------------------------------------
+
+            response_json = response.json()
+
+            results = response_json.get(
+                "results",
+                [],
             )
-        )
 
-        integration_items.append(
-            integration_item
-        )
+            # ------------------------------------------------
+            # Convert HubSpot records to IntegrationItems
+            # ------------------------------------------------
+
+            for result in results:
+
+                integration_item = (
+                    create_integration_item_metadata_object(
+                        result
+                    )
+                )
+
+                integration_items.append(
+                    integration_item
+                )
+
+            # ------------------------------------------------
+            # Get next page cursor
+            # ------------------------------------------------
+
+            paging = response_json.get(
+                "paging",
+                {}
+            )
+
+            next_page = paging.get(
+                "next"
+            )
+
+            if not next_page:
+
+                break
+
+            after = next_page.get(
+                "after"
+            )
+
+            if not after:
+
+                break
+
+    # --------------------------------------------------------
+    # Final output
+    # --------------------------------------------------------
 
     print(
         "HubSpot Integration Items:",
         integration_items,
+    )
+
+    print(
+        f"Total HubSpot Integration Items: "
+        f"{len(integration_items)}"
     )
 
     return integration_items

@@ -22,6 +22,8 @@ from integrations.hubspot import (
     oauth2callback_hubspot,
 )
 
+from redis_client import close_redis
+
 
 # ============================================================
 # FastAPI Application
@@ -56,6 +58,15 @@ def read_root():
     return {
         "Ping": "Pong"
     }
+
+
+# ============================================================
+# Shutdown
+# ============================================================
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_redis()
 
 
 # ============================================================
